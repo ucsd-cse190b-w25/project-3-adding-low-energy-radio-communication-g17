@@ -70,15 +70,28 @@
  
  uint8_t UPDATE_CHAR[]={0x01,0x06,0xFD,0x09,0xff,0xff,0xff,0xff,0x01,0x01,0x01,0x01,0x01,0x01,0x01};
  
- uint8_t DISCONNECT[] = {}; // TODO - fill this in
+ uint8_t DISCONNECT[] = {0x01, 0x06, 0x04, 0x03};
  uint8_t EVENT_DISCONNECTED[]={0x04,0x05,0x04,0x00};
  uint8_t EVENT_DISCONNECT_PENDING[] = {0x04, 0x0F, 0x04, 0x00, 0x01, 0x06, 0x04};
  
  uint8_t EVENT_CONNECTED[] = {0x04, 0x3E, 0x13, 0x01, 0x00};
  uint8_t EVENT_GATT_CHANGED[] = {0x04, 0xFF, 0x0B, 0x01, 0x0C};
  
- uint8_t ACI_GAP_SET_NON_DISCOVERABLE[] = {}; // TODO - fill this in
- uint8_t ACI_GAP_SET_NON_DISCOVERABLE_COMPLETE[] = {}; // TODO - fill this in
+ /*
+  * 0x1: indicates the packet is a command
+  * 0x81FC: OpCode for setting BLE as non-discoverable
+  * 0x00 indicates that there are no parameters
+  */
+ uint8_t ACI_GAP_SET_NON_DISCOVERABLE[] = {0x01, 0x81, 0xFC, 0x00 }; // TODO - fill this in
  
+ /*
+  * 0x4: indicates the packet is an event
+  * 0x0E OpCode for command complete
+  * 0x04: indicates that there are 4 parameters
+  * 0xFC82 indicates the command that was complete
+  * 0x00 indicates that the event was successful.
+  */
+ uint8_t ACI_GAP_SET_NON_DISCOVERABLE_COMPLETE[] = { 0x4, 0x0E, 0x04, 0x1, 0x82, 0xFC, 0x00 }; // TODO - fill this in
+
  #endif /* INC_BLE_COMMANDS_H_ */
  
