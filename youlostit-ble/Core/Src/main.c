@@ -22,6 +22,7 @@
 #include "ble.h"
 #include "i2c.h"
 #include "lsm6dsl.h"
+#include "led.h"
 #include "timer.h"
 
 #include <stdlib.h>
@@ -41,40 +42,69 @@ volatile int enable_leds = 0; // indicator to enable leds (when in lost mode)
 
 
 #define	MOTION_THRESHOLD	5000 // threshold macro for which device registers motion (to filter out noise)
-#define MINUTE_CYCLE	2400 // minute cycle macro to track when 1 minute passed at 20Hz
+#define MINUTE_CYCLE	400 // minute cycle macro to track when 1 minute passed at 40Hz
 #define SECOND_CYCLE 40
 #define PRIVTAG_NAME "TEAM_G17"
 volatile int minute_cnt = 0; // counter to track minute passed
 volatile int second_cnt = 0;
-volatile int check_motion = 0; // indicator for device to check for motion
+volatile int in_motion = 0; // indicator for device to check for motion
+volatile int stationary = 1;
 volatile uint8_t minutes_lost = 0; // counter to track the number of minutes and display with leds
 volatile uint8_t seconds_lost = 0; // counter to track the number of minutes and display with leds
 
-void TIM2_IRQHandler() {
-	// check for status update from interrupt
-	if(TIM2->SR & TIM_SR_UIF)
-	{
-		// clear status update
-		TIM2->SR &= ~TIM_SR_UIF;
+//void EXTI15_10_IRQHandler(void)
+//{
+//    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_11) != RESET)  // Check if EXTI11 triggered
+//    {
+//        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_11);  // Clear interrupt flag
+//        stationary = 1;
+//    }
+//}
 
-		if (++second_cnt == SECOND_CYCLE) {
-			seconds_lost++;
-			second_cnt = 0;
-		}
+//void LPTIM1_IRQHandler() {
+//    // Check if the auto-reload match interrupt occurred
+//    if (LPTIM1->ISR & LPTIM_ISR_ARRM)
+//    {
+//        printf("we are not moving!!\n");
+//
+//        if (++second_cnt == SECOND_CYCLE) {
+//            seconds_lost++;
+//            second_cnt = 0;
+//        }
+//
+//        // Check if a full minute has passed
+//        if (++minute_cnt == MINUTE_CYCLE)
+//        {
+//            minutes_lost++;
+//            minute_cnt = 0;
+//        }
+//
+//        // Clear the interrupt flag by writing 1 to ICR
+//        LPTIM1->ICR |= LPTIM_ICR_ARRMCF;
+//    }
+//}
 
+void LPTIM1_IRQHandler() {
+    // Print ISR register before clearing the flag
+    printf("ISR before clear: %08lX\n", LPTIM1->ISR);
 
-		// check if minute counter reaches a minute of the device not moving
-		if (++minute_cnt == MINUTE_CYCLE)
-		{
-			// if lost (reached a minute), initiate lost mode
-			minutes_lost++;
-			minute_cnt = 0;
-		}
+    // Check if the interrupt is triggered by the ARR match
+    if (LPTIM1->ISR & LPTIM_ISR_ARRM) {
+        // Clear the ARR match interrupt flag
+        LPTIM1->ICR |= LPTIM_ICR_ARRMCF;
+        LPTIM1->ICR |= LPTIM_ICR_CMPMCF;
+        // Print the timer's current count
+        printf("LPTIM1 CNT: %lu\n", LPTIM1->CNT);
 
-		// initiate check for motion
-		check_motion = 1;
-	}
+        // Print the interrupt trigger time
+        printf("Interrupt Triggered! Time: %lu\n", second_cnt);
 
+        // Increment second count
+        second_cnt++;
+
+        // Print ISR register after clearing the flag
+        printf("ISR after clear: %08lX\n", LPTIM1->ISR);
+    }
 }
 
 
@@ -85,6 +115,20 @@ int _write(int file, char *ptr, int len) {
         ITM_SendChar(*ptr++);
     }
     return len;
+}
+
+void check_wakeup_source(void) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t pending = NVIC->ISPR[i];
+        if (pending) {
+            for (int j = 0; j < 32; j++) {
+                if (pending & (1 << j)) {
+                    int irq_number = i * 32 + j;
+                    printf("Interrupt %d triggered WFI\n", irq_number);
+                }
+            }
+        }
+    }
 }
 
 int main(void) {
@@ -98,17 +142,22 @@ int main(void) {
   MX_GPIO_Init();
   MX_SPI3_Init();
 
+
   //RESET BLE MODULE
   HAL_GPIO_WritePin(BLE_RESET_GPIO_Port,BLE_RESET_Pin,GPIO_PIN_RESET);
   HAL_Delay(10);
   HAL_GPIO_WritePin(BLE_RESET_GPIO_Port,BLE_RESET_Pin,GPIO_PIN_SET);
 
   ble_init();
+  setDiscoverability(0);
 
-  HAL_Delay(10);
-
-  timer_init(TIM2);
-  timer_set_ms(TIM2, 50);
+  timer_init(LPTIM1);
+  if ((RCC->CCIPR & RCC_CCIPR_LPTIM1SEL) == (RCC_CCIPR_LPTIM1SEL_1 | RCC_CCIPR_LPTIM1SEL_0)) {
+      printf("LPTIM1 is using LSE as the clock source.\n");
+  } else {
+      printf("LPTIM1 is NOT using LSE as the clock source.\n");
+  }
+//  timer_set_seconds(LPTIM1, 1);
   __enable_irq();
 
   // Initialize I2C
@@ -117,50 +166,49 @@ int main(void) {
   // Initialize Accelerometer
   lsm6dsl_init();
 
+  // Initialize LEDs
+  leds_init();
+
   // initialize previous and current x,y,z accelerometer values
-  int16_t prev_x = 0;
-  int16_t prev_y = 0;
-  int16_t prev_z = 0;
-  int16_t curr_x = 0;
-  int16_t curr_y = 0;
-  int16_t curr_z = 0;
+  int16_t x = 0;
+  int16_t y = 0;
+  int16_t z = 0;
+
+  RCC->AHB1ENR |= RCC_APB1ENR1_PWREN;
+  PWR->CR1 &= ~PWR_CR1_LPMS;
+  PWR->CR1 |= PWR_CR1_LPMS_STOP2;
+  SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
 
 
   // Read Current Accelerometer Values and Set as Previous
-  lsm6dsl_read_xyz(&prev_x, &prev_y, &prev_z);
+//  lsm6dsl_read_xyz(&x, &y, &z);
 
   uint8_t nonDiscoverable = 0;
-
   while (1) {
-
-
-		// Read Current Accelerometer Values
-		lsm6dsl_read_xyz(&curr_x, &curr_y, &curr_z);
-
-		// check if difference in accelerometer readings surpass motion threshold
-		if (abs(abs(curr_x) - abs(prev_x)) > MOTION_THRESHOLD
-		 || abs(abs(curr_y) - abs(prev_y)) > MOTION_THRESHOLD
-		 || abs(abs(curr_z) - abs(prev_z)) > MOTION_THRESHOLD) {
-				// exit lost mode, turn off leds and reset minute counter
-				minutes_lost = 0;
-				seconds_lost = 0;
-				second_cnt = 0;
-				minute_cnt = 0;
-
-				disconnectBLE();
-				setDiscoverability(0);
-				nonDiscoverable = 1;
-			}
-			// update previous accelerometer values with current ones
-			prev_x = curr_x;
-			prev_y = curr_y;
-			prev_z = curr_z;
-
-			// turn off check motion indicator
-			check_motion = 0;
-			if(!nonDiscoverable && HAL_GPIO_ReadPin(BLE_INT_GPIO_Port,BLE_INT_Pin)){
+	  leds_set(0x00);
+//	  if (stationary) {
+//		  leds_set(0x11);
+//		  stationary = 0;
+//	  } else {
+//		  minutes_lost = 0;
+//		  seconds_lost = 0;
+//		  second_cnt = 0;
+//		  minute_cnt = 0;
+//
+//		  in_motion = 1;
+//
+//
+//		  disconnectBLE();
+//		  standbyBLE();
+//		  setDiscoverability(0);
+//		  nonDiscoverable = 1;
+//		  leds_set(0x00);
+//		  stationary = 1;
+//	  }
+	  lsm6dsl_read_xyz(&x, &y, &z);
+	  if (!nonDiscoverable && HAL_GPIO_ReadPin(BLE_INT_GPIO_Port,BLE_INT_Pin)) {
 	    catchBLE();
-	  }else{
+	  } else {
 		  if (minutes_lost) {
 			  nonDiscoverable = 0;
 			  setDiscoverability(1);
@@ -181,8 +229,11 @@ int main(void) {
 
 		  HAL_Delay(1000);
 	  }
-	  // Wait for interrupt, only uncomment if low power is needed
-	  //__WFI();
+	  check_wakeup_source();
+	  __WFI();
+	  check_wakeup_source();
+	  leds_set(0x11);
+	  HAL_Delay(1000);
   }
 }
 
@@ -320,9 +371,18 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(BLE_CS_GPIO_Port, &GPIO_InitStruct);
 
+  /* */
+  GPIO_InitStruct.Pin = GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;  // Trigger on falling edge (adjust as needed)
+  GPIO_InitStruct.Pull = GPIO_NOPULL;           // No internal pull-up/down
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
